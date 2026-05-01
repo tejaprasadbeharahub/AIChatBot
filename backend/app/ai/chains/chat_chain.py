@@ -37,5 +37,16 @@ def _normalize_content(content: object) -> str:
 
 def generate_reply(request: ChatRequest) -> str:
     model = get_chat_model(temperature=request.temperature)
-    result = model.invoke(_to_langchain_messages(request))
-    return _normalize_content(result.content)
+    try:
+        result = model.invoke(_to_langchain_messages(request))
+        return _normalize_content(result.content)
+    except Exception as exc:
+        message = str(exc)
+        lowered = message.lower()
+        if "api key" in lowered and ("invalid" in lowered or "incorrect" in lowered or "unauthorized" in lowered):
+            raise ValueError("Invalid LITELLM_API_KEY. Please use a valid key for your LiteLLM proxy.") from exc
+        if "key_model_access_denied" in lowered or "not allowed to access model" in lowered:
+            raise ValueError(
+                "Your LiteLLM key does not have access to this model. Set LLM_MODEL=gemini/gemini-2.5-flash in .env."
+            ) from exc
+        raise
