@@ -16,6 +16,7 @@ class Settings(BaseSettings):
 
     litellm_proxy_url: Optional[str] = None
     litellm_api_key: Optional[str] = None
+    gemini_api_key: Optional[str] = None
     llm_model: Optional[str] = None
     litellm_embedding_model: Optional[str] = None
     image_gen_model: Optional[str] = None
