@@ -14,6 +14,9 @@ class Settings(BaseSettings):
 
     secret_key: Optional[str] = None
     jwt_expire_minutes: int = 480
+    jwt_secret_key: Optional[str] = None
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 60
     app_name: Optional[str] = None
     environment: Optional[str] = None
 

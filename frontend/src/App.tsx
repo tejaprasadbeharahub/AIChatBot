@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
-import { apiRequest } from './lib/api'
-import type { ChatApiResponse, ChatHistoryItem } from './types'
+import { clearStoredToken, getStoredToken, login, register } from './api/auth'
+import { getChats, getMessages, sendChatMessage } from './api/chat'
+import type { Chat, Message } from './types/chat'
 
 type ChatRole = 'user' | 'assistant'
 
@@ -15,25 +16,42 @@ function createId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 }
 
+function toUiMessages(items: Message[]): ChatMessage[] {
+  return items.map((item) => ({
+    id: item.id,
+    role: item.role,
+    content: item.content,
+  }))
+}
+
+function formatChatTitle(chat: Chat): string {
+  if (chat.title && chat.title.trim().length > 0) {
+    return chat.title
+  }
+  return 'Untitled chat'
+}
+
 function App() {
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      id: createId(),
-      role: 'assistant',
-      content: 'Hello. I am ready. Ask me anything and I will answer using Gemini.',
-    },
-  ])
+  const [token, setToken] = useState<string | null>(() => getStoredToken())
+  const [authMode, setAuthMode] = useState<'login' | 'register'>('login')
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+
+  const [chats, setChats] = useState<Chat[]>([])
+  const [activeChatId, setActiveChatId] = useState<string | null>(null)
+  const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
-  const [isLoading, setIsLoading] = useState(false)
+
+  const [isBootstrapping, setIsBootstrapping] = useState(false)
+  const [isLoadingChats, setIsLoadingChats] = useState(false)
+  const [isLoadingMessages, setIsLoadingMessages] = useState(false)
+  const [isSending, setIsSending] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   const listRef = useRef<HTMLDivElement | null>(null)
 
   const turnsForApi = useMemo(
-    () =>
-      messages
-        .filter((message, index) => !(index === 0 && message.role === 'assistant'))
-        .map((message): ChatHistoryItem => ({ role: message.role, content: message.content })),
+    () => messages.map((message) => ({ role: message.role, content: message.content })),
     [messages],
   )
 
@@ -42,12 +60,131 @@ function App() {
     if (container) {
       container.scrollTop = container.scrollHeight
     }
-  }, [messages, isLoading])
+  }, [messages, isSending])
+
+  useEffect(() => {
+    if (!token) {
+      return
+    }
+
+    let cancelled = false
+    async function bootstrap() {
+      setIsBootstrapping(true)
+      setError(null)
+      try {
+        const allChats = await getChats()
+        if (cancelled) {
+          return
+        }
+        setChats(allChats)
+        if (allChats.length > 0) {
+          const first = allChats[0]
+          setActiveChatId(first.id)
+          const chatMessages = await getMessages(first.id)
+          if (cancelled) {
+            return
+          }
+          setMessages(toUiMessages(chatMessages))
+        } else {
+          setActiveChatId(null)
+          setMessages([])
+        }
+      } catch (requestError) {
+        if (cancelled) {
+          return
+        }
+        const message = requestError instanceof Error ? requestError.message : 'Could not load chats'
+        setError(message)
+      } finally {
+        if (!cancelled) {
+          setIsBootstrapping(false)
+        }
+      }
+    }
+
+    void bootstrap()
+    return () => {
+      cancelled = true
+    }
+  }, [token])
+
+  async function refreshChats(keepCurrent = true): Promise<Chat[]> {
+    setIsLoadingChats(true)
+    try {
+      const allChats = await getChats()
+      setChats(allChats)
+      if (!keepCurrent && allChats.length > 0) {
+        setActiveChatId(allChats[0].id)
+      }
+      return allChats
+    } finally {
+      setIsLoadingChats(false)
+    }
+  }
+
+  async function handleAuth(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!email.trim() || !password.trim()) {
+      return
+    }
+
+    setError(null)
+    setIsBootstrapping(true)
+    try {
+      const normalizedEmail = email.trim().toLowerCase()
+      if (authMode === 'login') {
+        const result = await login(normalizedEmail, password)
+        setToken(result.access_token)
+      } else {
+        const result = await register(normalizedEmail, password)
+        setToken(result.access_token)
+      }
+      setPassword('')
+    } catch (requestError) {
+      const message = requestError instanceof Error ? requestError.message : 'Authentication failed'
+      setError(message)
+    } finally {
+      setIsBootstrapping(false)
+    }
+  }
+
+  async function handleChatSelect(chatId: string) {
+    setActiveChatId(chatId)
+    setIsLoadingMessages(true)
+    setError(null)
+    try {
+      const history = await getMessages(chatId)
+      setMessages(toUiMessages(history))
+    } catch (requestError) {
+      const message = requestError instanceof Error ? requestError.message : 'Could not load chat messages'
+      setError(message)
+    } finally {
+      setIsLoadingMessages(false)
+    }
+  }
+
+  function startNewChat() {
+    setActiveChatId(null)
+    setMessages([])
+    setError(null)
+    setInput('')
+  }
+
+  async function handleLogout() {
+    clearStoredToken()
+    setToken(null)
+    setChats([])
+    setActiveChatId(null)
+    setMessages([])
+    setInput('')
+    setPassword('')
+    setError(null)
+  }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
     const trimmed = input.trim()
-    if (!trimmed || isLoading) {
+    if (!trimmed || isSending || !token) {
       return
     }
 
@@ -60,15 +197,13 @@ function App() {
     setMessages((prev) => [...prev, userMessage])
     setInput('')
     setError(null)
-    setIsLoading(true)
+    setIsSending(true)
 
     try {
-      const response = await apiRequest<ChatApiResponse>('/api/chat', {
-        method: 'POST',
-        body: JSON.stringify({
-          message: trimmed,
-          history: turnsForApi,
-        }),
+      const response = await sendChatMessage({
+        message: trimmed,
+        history: turnsForApi,
+        chat_id: activeChatId ?? undefined,
       })
 
       const assistantMessage: ChatMessage = {
@@ -77,33 +212,129 @@ function App() {
         content: response.reply,
       }
       setMessages((prev) => [...prev, assistantMessage])
+      setActiveChatId(response.chat_id)
+      await refreshChats(true)
     } catch (requestError) {
       const message = requestError instanceof Error ? requestError.message : 'Unexpected error'
       setError(message)
     } finally {
-      setIsLoading(false)
+      setIsSending(false)
     }
   }
 
+  if (!token) {
+    return (
+      <main className="auth-shell">
+        <section className="auth-card">
+          <p className="eyebrow">Amzur Employee Access</p>
+          <h1>Sign in to your AI Workspace</h1>
+          <p className="subtitle">Use your @amzur.com account to load your saved chat history.</p>
+
+          <div className="auth-switch">
+            <button
+              type="button"
+              className={authMode === 'login' ? 'tab active' : 'tab'}
+              onClick={() => setAuthMode('login')}
+            >
+              Login
+            </button>
+            <button
+              type="button"
+              className={authMode === 'register' ? 'tab active' : 'tab'}
+              onClick={() => setAuthMode('register')}
+            >
+              Register
+            </button>
+          </div>
+
+          <form onSubmit={handleAuth} className="auth-form">
+            <label>
+              Work Email
+              <input
+                type="email"
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+                placeholder="you@amzur.com"
+                required
+              />
+            </label>
+            <label>
+              Password
+              <input
+                type="password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                placeholder="Enter password"
+                minLength={8}
+                required
+              />
+            </label>
+            <button type="submit" className="auth-submit" disabled={isBootstrapping}>
+              {isBootstrapping ? 'Please wait...' : authMode === 'login' ? 'Login' : 'Create account'}
+            </button>
+          </form>
+          {error ? <p className="error-text">{error}</p> : null}
+        </section>
+      </main>
+    )
+  }
+
   return (
-    <main className="app-shell">
+    <main className="workspace-shell">
+      <aside className="chat-list-panel">
+        <div className="list-header">
+          <div>
+            <p className="eyebrow">LangChain + Gemini</p>
+            <h2>Amzur AI Chatbot</h2>
+          </div>
+          <button type="button" className="ghost-btn" onClick={handleLogout}>
+            Logout
+          </button>
+        </div>
+
+        <button type="button" className="new-chat-btn" onClick={startNewChat}>
+          + New chat
+        </button>
+
+        <div className="chat-list" aria-live="polite">
+          {isLoadingChats ? <p className="meta-text">Refreshing chats...</p> : null}
+          {chats.length === 0 ? <p className="meta-text">No previous chats yet.</p> : null}
+          {chats.map((chat) => (
+            <button
+              key={chat.id}
+              type="button"
+              className={chat.id === activeChatId ? 'chat-item active' : 'chat-item'}
+              onClick={() => void handleChatSelect(chat.id)}
+            >
+              <span>{formatChatTitle(chat)}</span>
+            </button>
+          ))}
+        </div>
+      </aside>
+
       <section className="chat-surface">
         <header className="chat-header">
           <div>
-            <p className="eyebrow">LangChain + Gemini</p>
-            <h1>Amzur AI Chatbot</h1>
-            <p className="subtitle">A fast conversational UI backed by your Python API.</p>
+            <p className="eyebrow">Private Workspace</p>
+            <h1>{activeChatId ? 'Conversation' : 'Start a new conversation'}</h1>
+            <p className="subtitle">Your chats are saved to PostgreSQL and restored after login.</p>
           </div>
         </header>
 
         <div ref={listRef} className="message-list" aria-live="polite">
+          {isBootstrapping || isLoadingMessages ? <p className="meta-text">Loading messages...</p> : null}
+          {!isBootstrapping && !isLoadingMessages && messages.length === 0 ? (
+            <article className="bubble-row bubble-assistant">
+              <div className="bubble">Hello. Start typing and I will save this chat automatically.</div>
+            </article>
+          ) : null}
           {messages.map((message) => (
             <article key={message.id} className={`bubble-row ${message.role === 'user' ? 'bubble-user' : 'bubble-assistant'}`}>
               <div className="bubble">{message.content}</div>
             </article>
           ))}
 
-          {isLoading ? (
+          {isSending ? (
             <article className="bubble-row bubble-assistant">
               <div className="bubble bubble-loading">Thinking</div>
             </article>
@@ -116,15 +347,14 @@ function App() {
               value={input}
               onChange={(event) => setInput(event.target.value)}
               className="composer-input"
-              placeholder="Ask a question..."
+              placeholder="Ask anything..."
               rows={2}
-              disabled={isLoading}
+              disabled={isSending || isBootstrapping}
             />
-            <button type="submit" className="composer-send" disabled={isLoading || input.trim().length === 0}>
-              {isLoading ? 'Sending...' : 'Send'}
+            <button type="submit" className="composer-send" disabled={isSending || isBootstrapping || input.trim().length === 0}>
+              {isSending ? 'Sending...' : 'Send'}
             </button>
           </form>
-
           {error ? <p className="error-text">{error}</p> : null}
         </footer>
       </section>
